@@ -4,8 +4,54 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { MermaidDiagram } from './MermaidDiagram';
-import { Play, Loader2, Terminal, FileText, Activity, AlertCircle, CheckCircle, AlertTriangle, XCircle, Lightbulb } from 'lucide-react';
+import { Play, Loader2, Terminal, FileText, Activity, AlertCircle, CheckCircle, XCircle, Lightbulb } from 'lucide-react';
 import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+// Helper function to safely convert any value to a displayable string
+const safeString = (value: any): string => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map(safeString).join(', ');
+  if (typeof value === 'object') {
+    if (value.message) return String(value.message);
+    if (value.text) return String(value.text);
+    if (value.name) return String(value.name);
+    if (value.description) return String(value.description);
+    if (value.value) return String(value.value);
+    try { return JSON.stringify(value); } catch { return '[Object]'; }
+  }
+  return String(value);
+};
+
+// Agent icons and colors for the SSE logs
+const AGENT_CONFIG: Record<string, { icon: string; color: string; name: string }> = {
+  'parser': { icon: '📝', color: 'text-blue-400', name: 'Parser' },
+  'analyzer': { icon: '🔍', color: 'text-purple-400', name: 'Analyzer' },
+  'complexity': { icon: '📊', color: 'text-green-400', name: 'Complexity' },
+  'validator': { icon: '✅', color: 'text-yellow-400', name: 'Validator' },
+  'diagram': { icon: '📈', color: 'text-pink-400', name: 'Diagram' },
+  'explainer': { icon: '💡', color: 'text-orange-400', name: 'Explainer' },
+  'report': { icon: '📋', color: 'text-cyan-400', name: 'Report' },
+  'pipeline': { icon: '⚙️', color: 'text-gray-400', name: 'Pipeline' },
+};
+
+const STATE_ICONS: Record<string, string> = {
+  'started': '▶️',
+  'running': '⚙️',
+  'finished': '✅',
+  'error': '❌',
+  'skipped': '⏭️',
+};
+
+interface LogEntry {
+  timestamp: Date;
+  agent?: string;
+  state?: string;
+  message: string;
+  type: 'info' | 'success' | 'error' | 'warning' | 'agent';
+  details?: string;
+}
 
 interface ComplexityMetric {
   big_o: string;
@@ -22,6 +68,14 @@ interface Artifact {
 interface CaseAnalysis {
   description: string;
   complexity: string;
+}
+
+interface DiagramData {
+  type: string;
+  name: string;
+  description: string;
+  mermaid: string;
+  syntax_valid: boolean;
 }
 
 interface AnalysisReport {
@@ -45,6 +99,10 @@ interface AnalysisReport {
   explanation: string;
   artifacts?: {
     [key: string]: Artifact;
+  };
+  diagram?: {
+    diagram?: DiagramData;
+    diagrams?: DiagramData[];
   };
   validation?: {
     status: string;
@@ -338,7 +396,8 @@ const DEFAULT_CODE = PREDEFINED_ALGORITHMS[2].code;
 
 export const ComplexityAnalyzer: React.FC = () => {
   const [inputCode, setInputCode] = useState(DEFAULT_CODE);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [currentAgent, setCurrentAgent] = useState<string | null>(null);
   const [status, setStatus] = useState<'idle' | 'analyzing' | 'fetching_report' | 'complete' | 'error'>('idle');
   const [report, setReport] = useState<AnalysisReport | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -352,6 +411,10 @@ export const ComplexityAnalyzer: React.FC = () => {
     scrollToBottom();
   }, [logs]);
 
+  const addLog = (entry: Omit<LogEntry, 'timestamp'>) => {
+    setLogs(prev => [...prev, { ...entry, timestamp: new Date() }]);
+  };
+
   const handleAnalyze = async () => {
     if (!inputCode.trim()) return;
 
@@ -359,9 +422,12 @@ export const ComplexityAnalyzer: React.FC = () => {
     setLogs([]);
     setReport(null);
     setErrorMsg(null);
+    setCurrentAgent(null);
 
     try {
       // 1. Start Analysis
+      addLog({ message: 'Iniciando análisis...', type: 'info' });
+      
       const startResponse = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -373,115 +439,156 @@ export const ComplexityAnalyzer: React.FC = () => {
       }
 
       const { analysis_id } = await startResponse.json();
-      setLogs(prev => [...prev, `Analysis started. ID: ${analysis_id}`]);
+      addLog({ message: `Analysis ID: ${analysis_id}`, type: 'info' });
 
       // 2. Listen for Progress (SSE)
       let capturedReportUrl: string | null = null;
+      
       await new Promise<void>((resolve, reject) => {
         const ctrl = new AbortController();
         
         fetchEventSource(`/api/status?analysis_id=${analysis_id}`, {
           method: 'GET',
           signal: ctrl.signal,
+          
           onopen(response) {
             if (response.ok) {
+              addLog({ message: 'Conectado al stream de progreso', type: 'success' });
               return Promise.resolve();
             } else {
               return Promise.reject(new Error(`Failed to connect to SSE: ${response.statusText}`));
             }
           },
+          
           onmessage(msg) {
             try {
+              // Skip empty messages
+              if (!msg.data || msg.data.trim() === '') return;
+              
+              // Filter out source code that might leak into logs
+              if (msg.data.includes('from typing import') || 
+                  msg.data.includes('class ') && msg.data.includes('def ') ||
+                  msg.data.includes('"""') ||
+                  msg.data.length > 1000) {
+                console.warn('Filtered large/code message from SSE');
+                return;
+              }
+
               const data = JSON.parse(msg.data);
               
-              // Format log message nicely
-              let displayMsg = "";
-              if (data.agent && data.state) {
-                  displayMsg = `[${data.agent}] ${data.state}`;
-                  if (data.summary) displayMsg += `: ${data.summary}`;
-              } else {
-                  displayMsg = typeof data === 'object' ? (data.message || data.status || JSON.stringify(data)) : String(data);
-              }
-              
-              setLogs(prev => [...prev, `> ${displayMsg}`]);
+              // Handle agent-based messages
+              if (data.agent) {
+                setCurrentAgent(data.agent);
+                const agentConfig = AGENT_CONFIG[data.agent] || { icon: '📦', color: 'text-gray-400', name: data.agent };
+                const stateIcon = STATE_ICONS[data.state] || '📋';
+                
+                let message = `${stateIcon} [${agentConfig.name}] ${data.state || 'processing'}`;
+                if (data.summary) message += `: ${data.summary}`;
+                
+                let details = '';
+                if (data.duration_ms) details += `Duración: ${data.duration_ms}ms`;
+                if (data.complexity) details += ` | Complejidad: ${safeString(data.complexity)}`;
+                
+                addLog({
+                  agent: data.agent,
+                  state: data.state,
+                  message,
+                  type: data.state === 'error' ? 'error' : data.state === 'finished' ? 'success' : 'agent',
+                  details: details || undefined
+                });
 
-              // Capture report URL if available (prefer report agent's artifact)
-              if (data.artifacts && data.artifacts.json) {
-                // If it's the report agent, this is definitely the one we want
-                if (data.agent === 'report') {
+                // Capture report URL
+                if (data.artifacts?.json) {
+                  if (data.agent === 'report') {
                     capturedReportUrl = data.artifacts.json;
-                } else if (!capturedReportUrl) {
-                    // Keep other artifacts as backup if we haven't found the main one yet
+                  } else if (!capturedReportUrl) {
                     capturedReportUrl = data.artifacts.json;
+                  }
+                }
+
+                // Check for completion
+                const isComplete = 
+                  (data.agent === 'pipeline' && data.state === 'finished') ||
+                  (data.agent === 'report' && data.state === 'finished');
+
+                if (isComplete) {
+                  setCurrentAgent(null);
+                  ctrl.abort();
+                  resolve();
+                }
+              } 
+              // Handle status-based messages (legacy format)
+              else if (data.status) {
+                addLog({
+                  message: `Status: ${data.status}`,
+                  type: data.status === 'error' ? 'error' : 'info',
+                  details: data.message
+                });
+
+                if (data.status === 'completed' || data.status === 'finished') {
+                  ctrl.abort();
+                  resolve();
                 }
               }
-
-              // Strict completion check:
-              // 1. Pipeline finished
-              // 2. Report agent finished
-              // 3. Explicit "completed" status (legacy)
-              const isPipelineFinished = data.agent === 'pipeline' && data.state === 'finished';
-              const isReportFinished = data.agent === 'report' && data.state === 'finished';
-              const isLegacyCompleted = data.status === 'completed' || data.status === 'finished';
-
-              if (isPipelineFinished || isReportFinished || isLegacyCompleted) {
-                ctrl.abort();
-                resolve();
+              // Handle generic messages
+              else if (data.message) {
+                addLog({ message: data.message, type: 'info' });
               }
+              // Handle progress updates
+              else if (data.progress !== undefined) {
+                addLog({ message: `Progreso: ${data.progress}%`, type: 'info' });
+              }
+              
             } catch (e) {
-              const logMessage = msg.data;
-              setLogs(prev => [...prev, `> ${logMessage}`]);
-
-              // Only abort on plain text if it explicitly says "Analysis complete" or similar specific phrase
-              // Avoid generic "finished" which might appear in normal log text
-              if (logMessage.toLowerCase().includes('analysis complete') || logMessage.toLowerCase().includes('pipeline finished')) {
-                ctrl.abort();
-                resolve();
+              // Plain text message
+              const logMessage = msg.data?.trim();
+              if (logMessage && logMessage.length < 500) {
+                addLog({ message: logMessage, type: 'info' });
+                
+                if (logMessage.toLowerCase().includes('analysis complete') || 
+                    logMessage.toLowerCase().includes('pipeline finished')) {
+                  ctrl.abort();
+                  resolve();
+                }
               }
             }
           },
+          
           onerror(err) {
             console.error("SSE Error:", err);
+            addLog({ message: `Error de conexión: ${err}`, type: 'error' });
             ctrl.abort();
             reject(err);
           },
+          
           onclose() {
-             resolve();
+            addLog({ message: 'Stream cerrado', type: 'info' });
+            resolve();
           }
         });
       });
 
       // 3. Get Final Report
       setStatus('fetching_report');
-      setLogs(prev => [...prev, 'Fetching final report...']);
+      addLog({ message: 'Obteniendo reporte final...', type: 'info' });
 
-      // Use captured URL or fallback to constructed URL
       const finalReportUrl = capturedReportUrl || `/api/analysis/${analysis_id}/agent/report/json`;
       const reportResponse = await fetch(finalReportUrl);
       
       if (!reportResponse.ok) {
-        // Fallback to the old endpoint if the artifact one fails
         console.warn("Failed to fetch artifact report, trying default endpoint...");
         const fallbackResponse = await fetch(`/api/report/${analysis_id}`);
         if (!fallbackResponse.ok) {
            throw new Error(`Failed to fetch report: ${reportResponse.statusText}`);
         }
         const fallbackData = await fallbackResponse.json();
-        setReport(fallbackData); // Assuming fallback has the old structure? Or maybe it's just empty.
+        setReport(fallbackData);
       } else {
         const reportData = await reportResponse.json();
         
-        // Handle different response structures
-        // 1. reportData.data (standard API wrapper)
-        // 2. reportData.report (LangSmith/Agent artifact structure)
-        // 3. reportData (direct object)
         const finalReport = reportData.data || reportData.report || reportData;
-
-        // Handle complexity_analysis structure variations
-        // Sometimes it's nested in complexity_analysis, sometimes direct
         const complexityData = finalReport.complexity_analysis || finalReport;
 
-        // Map to expected structure
         const formattedReport: AnalysisReport = {
             analysis_id: reportData.analysis_id || analysis_id,
             complexity_analysis: {
@@ -502,31 +609,13 @@ export const ComplexityAnalyzer: React.FC = () => {
       }
 
       setStatus('complete');
-      setLogs(prev => [...prev, 'Analysis complete!']);
+      addLog({ message: '✅ Análisis completado exitosamente!', type: 'success' });
 
     } catch (err: any) {
       console.error(err);
       setStatus('error');
       setErrorMsg(err.message || 'An unexpected error occurred');
-      setLogs(prev => [...prev, `Error: ${err.message}`]);
-    }
-  };
-
-  const getValidationColor = (status?: string) => {
-    switch (status?.toUpperCase()) {
-      case 'APPROVED': return 'text-green-400';
-      case 'WEAK': return 'text-yellow-400';
-      case 'REJECTED': return 'text-red-400';
-      default: return 'text-gray-400';
-    }
-  };
-
-  const getValidationIcon = (status?: string) => {
-    switch (status?.toUpperCase()) {
-      case 'APPROVED': return <CheckCircle className="w-5 h-5 text-green-400" />;
-      case 'WEAK': return <AlertTriangle className="w-5 h-5 text-yellow-400" />;
-      case 'REJECTED': return <XCircle className="w-5 h-5 text-red-400" />;
-      default: return <Activity className="w-5 h-5 text-gray-400" />;
+      addLog({ message: `❌ Error: ${err.message}`, type: 'error' });
     }
   };
 
@@ -540,11 +629,36 @@ export const ComplexityAnalyzer: React.FC = () => {
             Algorithmic Complexity Analyzer
           </h1>
         </div>
-        <div className="flex items-center gap-2">
-          {status === 'analyzing' && <span className="flex items-center gap-2 text-sm text-blue-400"><Loader2 className="w-4 h-4 animate-spin" /> Analyzing...</span>}
-          {status === 'fetching_report' && <span className="flex items-center gap-2 text-sm text-purple-400"><Loader2 className="w-4 h-4 animate-spin" /> Generating Report...</span>}
-          {status === 'complete' && <span className="text-sm text-green-400 font-medium">Analysis Complete</span>}
-          {status === 'error' && <span className="text-sm text-red-400 font-medium">Error</span>}
+        <div className="flex items-center gap-4">
+          {status === 'analyzing' && currentAgent && (
+            <div className="flex items-center gap-2 px-3 py-1 bg-gray-800 rounded-full">
+              <span className="text-lg">{AGENT_CONFIG[currentAgent]?.icon || '⚙️'}</span>
+              <span className={`text-sm ${AGENT_CONFIG[currentAgent]?.color || 'text-gray-400'}`}>
+                {AGENT_CONFIG[currentAgent]?.name || currentAgent}
+              </span>
+              <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
+            </div>
+          )}
+          {status === 'analyzing' && !currentAgent && (
+            <span className="flex items-center gap-2 text-sm text-blue-400">
+              <Loader2 className="w-4 h-4 animate-spin" /> Iniciando...
+            </span>
+          )}
+          {status === 'fetching_report' && (
+            <span className="flex items-center gap-2 text-sm text-purple-400">
+              <Loader2 className="w-4 h-4 animate-spin" /> Generando Reporte...
+            </span>
+          )}
+          {status === 'complete' && (
+            <span className="flex items-center gap-2 text-sm text-green-400 font-medium">
+              <CheckCircle className="w-4 h-4" /> Análisis Completo
+            </span>
+          )}
+          {status === 'error' && (
+            <span className="flex items-center gap-2 text-sm text-red-400 font-medium">
+              <XCircle className="w-4 h-4" /> Error
+            </span>
+          )}
         </div>
       </header>
 
@@ -591,17 +705,38 @@ export const ComplexityAnalyzer: React.FC = () => {
 
           {/* Logs Console */}
           <div className="h-1/3 border-t border-gray-800 bg-black p-4 flex flex-col min-h-0">
-            <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-2">
-              <Terminal className="w-3 h-3" /> System Logs
-            </label>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-xs font-bold text-gray-500 uppercase tracking-wider flex items-center gap-2">
+                <Terminal className="w-3 h-3" /> System Logs
+              </label>
+              {currentAgent && (
+                <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded-full animate-pulse">
+                  {AGENT_CONFIG[currentAgent]?.icon} {AGENT_CONFIG[currentAgent]?.name || currentAgent}
+                </span>
+              )}
+            </div>
             <div className="flex-1 overflow-y-auto font-mono text-xs space-y-1 pr-2 scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
-              {logs.length === 0 && <span className="text-gray-600 italic">Ready to analyze...</span>}
-              {logs.map((log, i) => (
-                <div key={i} className="text-gray-400 break-words">
-                  <span className="text-gray-600 mr-2">[{new Date().toLocaleTimeString()}]</span>
-                  {log}
-                </div>
-              ))}
+              {logs.length === 0 && <span className="text-gray-600 italic">Listo para analizar...</span>}
+              {logs.map((log, i) => {
+                const timeStr = log.timestamp.toLocaleTimeString();
+                const typeColors = {
+                  info: 'text-gray-400',
+                  success: 'text-green-400',
+                  error: 'text-red-400',
+                  warning: 'text-yellow-400',
+                  agent: log.agent ? (AGENT_CONFIG[log.agent]?.color || 'text-gray-400') : 'text-gray-400'
+                };
+                
+                return (
+                  <div key={i} className={`break-words ${typeColors[log.type]}`}>
+                    <span className="text-gray-600 mr-2">[{timeStr}]</span>
+                    <span>{log.message}</span>
+                    {log.details && (
+                      <span className="text-gray-500 ml-2 text-[10px]">({log.details})</span>
+                    )}
+                  </div>
+                );
+              })}
               <div ref={logsEndRef} />
             </div>
           </div>
@@ -614,9 +749,21 @@ export const ComplexityAnalyzer: React.FC = () => {
               {/* Validation Status Banner */}
               <div className="flex items-center justify-between bg-gray-900 rounded-xl p-4 border border-gray-800">
                 <div className="flex items-center gap-3">
-                  {getValidationIcon(report.validation?.status)}
+                  {report.validation?.status?.toUpperCase() === 'APPROVED' ? (
+                    <CheckCircle className="w-5 h-5 text-green-400" />
+                  ) : report.validation?.status?.toUpperCase() === 'WEAK' ? (
+                    <AlertCircle className="w-5 h-5 text-yellow-400" />
+                  ) : report.validation?.status?.toUpperCase() === 'REJECTED' ? (
+                    <XCircle className="w-5 h-5 text-red-400" />
+                  ) : (
+                    <Activity className="w-5 h-5 text-gray-400" />
+                  )}
                   <div>
-                    <h3 className={`font-bold ${getValidationColor(report.validation?.status)}`}>
+                    <h3 className={`font-bold ${
+                      report.validation?.status?.toUpperCase() === 'APPROVED' ? 'text-green-400' :
+                      report.validation?.status?.toUpperCase() === 'WEAK' ? 'text-yellow-400' :
+                      report.validation?.status?.toUpperCase() === 'REJECTED' ? 'text-red-400' : 'text-gray-400'
+                    }`}>
                       Analysis Status: {report.validation?.status || 'UNKNOWN'}
                     </h3>
                     <p className="text-xs text-gray-500">
@@ -749,12 +896,73 @@ export const ComplexityAnalyzer: React.FC = () => {
                 </div>
               )}
 
-              {/* Diagrams */}
-              {report.artifacts && Object.entries(report.artifacts).map(([key, artifact]) => (
+              {/* Diagrams Section */}
+              {report.diagram && (
+                <div className="space-y-6">
+                  <h2 className="text-xl font-bold text-gray-200 flex items-center gap-2">
+                    <Activity className="w-5 h-5" />
+                    Diagramas
+                  </h2>
+                  
+                  {/* Main Diagram */}
+                  {report.diagram.diagram?.mermaid && report.diagram.diagram?.syntax_valid && (
+                    <div className="bg-gray-900 rounded-xl p-6 border border-gray-800 shadow-xl">
+                      <div className="flex items-center justify-between mb-4">
+                        <div>
+                          <h3 className="text-lg font-semibold text-gray-300">
+                            {report.diagram.diagram.name || 'Diagrama Principal'}
+                          </h3>
+                          <p className="text-sm text-gray-500">{report.diagram.diagram.description}</p>
+                        </div>
+                        <span className="px-2 py-1 text-xs rounded bg-blue-900 text-blue-300">
+                          {report.diagram.diagram.type}
+                        </span>
+                      </div>
+                      <div className="overflow-x-auto bg-white rounded-lg p-4">
+                        <MermaidDiagram chart={report.diagram.diagram.mermaid} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Additional Diagrams from diagrams array */}
+                  {report.diagram.diagrams && report.diagram.diagrams.length > 0 && (
+                    <div className="grid grid-cols-1 gap-6">
+                      {report.diagram.diagrams.map((diag: any, index: number) => (
+                        diag.syntax_valid && diag.mermaid && (
+                          <div key={index} className="bg-gray-900 rounded-xl p-6 border border-gray-800 shadow-xl">
+                            <div className="flex items-center justify-between mb-4">
+                              <div>
+                                <h3 className="text-lg font-semibold text-gray-300">
+                                  {diag.name || `Diagrama ${index + 1}`}
+                                </h3>
+                                <p className="text-sm text-gray-500">{diag.description}</p>
+                              </div>
+                              <span className={`px-2 py-1 text-xs rounded ${
+                                diag.type === 'recursion_tree' ? 'bg-green-900 text-green-300' :
+                                diag.type === 'flowchart' ? 'bg-purple-900 text-purple-300' :
+                                diag.type === 'call_tree' ? 'bg-orange-900 text-orange-300' :
+                                'bg-gray-700 text-gray-300'
+                              }`}>
+                                {diag.type}
+                              </span>
+                            </div>
+                            <div className="overflow-x-auto bg-white rounded-lg p-4">
+                              <MermaidDiagram chart={diag.mermaid} />
+                            </div>
+                          </div>
+                        )
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Legacy artifacts support */}
+              {report.artifacts && Object.entries(report.artifacts).map(([key, artifact]: [string, any]) => (
                 artifact.artifact_type === 'mermaid' && (
-                  <div key={key} className="bg-white rounded-xl p-6 border border-gray-200 shadow-xl">
-                    <h2 className="text-lg font-semibold text-gray-800 mb-4 capitalize">{key.replace(/_/g, ' ')}</h2>
-                    <div className="overflow-x-auto">
+                  <div key={key} className="bg-gray-900 rounded-xl p-6 border border-gray-800 shadow-xl">
+                    <h2 className="text-lg font-semibold text-gray-300 mb-4 capitalize">{key.replace(/_/g, ' ')}</h2>
+                    <div className="overflow-x-auto bg-white rounded-lg p-4">
                       <MermaidDiagram chart={artifact.content} />
                     </div>
                   </div>
