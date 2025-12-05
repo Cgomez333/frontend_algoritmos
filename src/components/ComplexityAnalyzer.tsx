@@ -4,7 +4,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { MermaidDiagram } from './MermaidDiagram';
-import { Play, Loader2, Terminal, FileText, Activity, AlertCircle, CheckCircle, XCircle, Lightbulb } from 'lucide-react';
+import { Play, Loader2, Terminal, FileText, Activity, AlertCircle, CheckCircle, XCircle, Lightbulb, Upload } from 'lucide-react';
 import { fetchEventSource } from '@microsoft/fetch-event-source';
 
 // Helper function to safely convert any value to a displayable string
@@ -402,6 +402,7 @@ export const ComplexityAnalyzer: React.FC = () => {
   const [report, setReport] = useState<AnalysisReport | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const scrollToBottom = () => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -413,6 +414,18 @@ export const ComplexityAnalyzer: React.FC = () => {
 
   const addLog = (entry: Omit<LogEntry, 'timestamp'>) => {
     setLogs(prev => [...prev, { ...entry, timestamp: new Date() }]);
+  };
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const content = e.target?.result as string;
+      setInputCode(content);
+    };
+    reader.readAsText(file);
   };
 
   const handleAnalyze = async () => {
@@ -667,9 +680,24 @@ export const ComplexityAnalyzer: React.FC = () => {
         <div className="w-1/3 flex flex-col border-r border-gray-800 bg-gray-900/50">
           {/* Code Input */}
           <div className="flex-1 flex flex-col p-4 min-h-0">
-            <label className="text-sm font-medium text-gray-400 mb-2 flex items-center gap-2">
-              <FileText className="w-4 h-4" /> Source Code
-            </label>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-sm font-medium text-gray-400 flex items-center gap-2">
+                <FileText className="w-4 h-4" /> Source Code
+              </label>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="text-xs flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                <Upload className="w-3 h-3" /> Upload File
+              </button>
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileUpload}
+                className="hidden"
+                accept=".txt,.py,.js,.ts,.cpp,.java,.c,.h"
+              />
+            </div>
             <select
               className="mb-2 bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
               onChange={(e) => {
